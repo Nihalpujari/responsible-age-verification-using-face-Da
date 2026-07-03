@@ -26,7 +26,7 @@ Canonical columns produced by every loader:
     original_race   raw race label ("" for Adience — no race label exists)
     license         data-use terms (matters for the regulatory section)
 
-NOTE on lossiness (document this in the notebook, do NOT hide it):
+NOTE on lossiness :
     - UTKFace has 5 race classes; FairFace has 7. UTKFace "Asian" cannot be
       split into East/Southeast Asian, and "Others" bundles several groups.
       So UTKFace race is only reliable at the COARSE level. race_fine for
@@ -44,26 +44,11 @@ import os
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------- #
-# Configuration — where the raw data lives.
-# Override with the FACE_AGE_DATA_ROOT environment variable, or edit DATA_ROOT.
-#
-# Expected layout under DATA_ROOT:
-#   data/
-#     fairface/
-#       fairface_label_train.csv
-#       fairface_label_val.csv
-#       train/ ...   val/ ...          (image folders referenced by the csv)
-#     utkface/
-#       UTKFace/ ...                    (jpgs named  age_gender_race_date.jpg)
-#     adience/
-#       fold_0_data.txt ... fold_4_data.txt
-#       faces/ <user_id>/ ...           (aligned face images)
-# --------------------------------------------------------------------------- #
 DATA_ROOT = Path(os.environ.get(
     "FACE_AGE_DATA_ROOT",
     Path(__file__).resolve().parent.parent / "data",
@@ -370,6 +355,71 @@ def _clean(df: pd.DataFrame, source: str) -> pd.DataFrame:
         logger.info("%s: dropped %d rows with unmapped labels.", source, dropped)
     logger.info("%s: %d usable rows.", source, len(df))
     return df
+
+
+# --------------------------------------------------------------------------- #
+# Duplicate / corrupt-image detection (perceptual hashing).
+#
+# Uses "average hash" (aHash): shrink the image to hash_size x hash_size grey
+# pixels, then record for each pixel whether it is brighter than the image's
+# mean. Two images that look near-identical produce the same bit pattern even
+# across datasets, resizes, or re-compression. Dependency-free (Pillow+numpy),
+# so no extra install and it stays runnable inside the notebook.
+# --------------------------------------------------------------------------- #
+def _average_hash(path: str, hash_size: int = 8) -> str | None:
+    """Return a hex aHash for one image, or None if it cannot be read."""
+    try:
+        from PIL import Image  # local import: only needed when hashing
+        img = Image.open(path).convert("L").resize(
+            (hash_size, hash_size), Image.Resampling.LANCZOS)
+    except Exception:
+        return None  # unreadable / corrupt image -> caller can drop it
+    arr = np.asarray(img, dtype=np.float64)
+    bits = (arr > arr.mean()).flatten()
+    value = 0
+    for b in bits:
+        value = (value << 1) | int(b)
+    width = (hash_size * hash_size) // 4  # hex digits needed
+    return f"{value:0{width}x}"
+
+
+def add_perceptual_hash(df: pd.DataFrame, hash_size: int = 8) -> pd.DataFrame:
+    """Add a 'phash' column to df. Rows whose image can't be read get None.
+
+    Note: this opens every image once, so it is the slow step — run it once and
+    reuse the result. On ~100k images expect a few minutes.
+    """
+    if df.empty:
+        return df.assign(phash=[])
+    out = df.copy()
+    out["phash"] = out["filepath"].apply(lambda p: _average_hash(p, hash_size))
+    n_bad = int(out["phash"].isna().sum())
+    if n_bad:
+        logger.info("perceptual hash: %d images unreadable/corrupt.", n_bad)
+    return out
+
+
+def find_duplicates(df: pd.DataFrame,
+                    cross_source_only: bool = False) -> pd.DataFrame:
+    """Return the rows that belong to a duplicate group (same phash).
+
+    Requires a 'phash' column (call add_perceptual_hash first).
+    If cross_source_only=True, keep only groups whose duplicates span more than
+    one dataset_source — i.e. the train/test LEAKAGE case that would inflate
+    test accuracy, which is the one that actually threatens the results.
+    """
+    if "phash" not in df.columns:
+        raise ValueError("call add_perceptual_hash(df) before find_duplicates()")
+    valid = df.dropna(subset=["phash"])
+    counts = valid.groupby("phash")["phash"].transform("size")
+    dupes = valid[counts > 1].copy()
+    if cross_source_only and not dupes.empty:
+        n_sources = dupes.groupby("phash")["dataset_source"].transform("nunique")
+        dupes = dupes[n_sources > 1]
+    dupes = dupes.sort_values("phash").reset_index(drop=True)
+    logger.info("find_duplicates: %d rows in duplicate groups%s.",
+                len(dupes), " (cross-dataset)" if cross_source_only else "")
+    return dupes
 
 
 def get_train_test(data_root: Path | None = None):

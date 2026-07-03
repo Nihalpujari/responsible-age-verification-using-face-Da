@@ -1,0 +1,52 @@
+# ========================
+# Python cache
+# ========================
+__pycache__/
+*.py[cod]
+
+# ========================
+# Virtual environments
+# ========================
+venv/
+env/
+.venv/
+
+# ========================
+# IDE files
+# ========================
+.vscode/
+.idea/
+.spyderproject
+.spyproject
+
+# ========================
+# Dataset folders (IMPORTANT)
+# inside face_age
+# ========================
+Code/face_age/adience/
+Code/face_age/fairface/
+Code/face_age/utkface/
+
+# ========================
+# Large files (IMPORTANT)
+# ========================
+*.pkl
+*.h5
+*.joblib
+*.model
+
+# ========================
+# OS junk files
+# ========================
+.DS_Store
+Thumbs.db
+
+# ========================
+# Logs
+# ========================
+*.log
+
+# ========================
+# Notebook checkpoints (if any)
+# ========================
+.ipynb_checkpoints/
