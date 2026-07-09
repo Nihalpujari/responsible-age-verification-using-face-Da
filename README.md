@@ -1,11 +1,12 @@
 # Responsible Age Classifier for Retail Analytics
 
 > A **gender-neutral, race-agnostic age-group classifier** for anonymous retail
-> footfall analytics — built as a *responsible AI* system: fair across
-> demographics, explainable, tested, and compliant by design.
+> footfall analytics — built as a *responsible AI* system: fairness is measured,
+> not assumed; risks and limitations are documented, not hidden.
 >
-> Course: **Responsible AI & Data Ethics** (SS2026). Deliverable: a documented,
-> runnable Jupyter notebook backed by the `face_age/` package.
+> Course: **Responsible AI & Data Ethics** (SS2026).
+> Deliverable: **`Code/Responsible_Age_Classifier_Week1_2.ipynb`** — a single,
+> documented, runnable Jupyter notebook.
 
 ---
 
@@ -14,170 +15,198 @@
 | Does | Does **not** do |
 |------|-----------------|
 | Estimate a coarse **age group** (9 buckets) from a face | Identify or recognise **who** a person is |
-| Produce **anonymous, aggregate** analytics (e.g. "30 % of visitors were 20–29 today") | Store faces, embeddings, or biometric templates |
-| Use gender/race labels **only internally**, to audit and prove fairness | Expose or output gender/race at deployment |
+| Produce **anonymous** age predictions for aggregate analytics | Store faces, embeddings, or biometric templates |
+| Use gender/race labels **only to audit fairness** after training | Ever take gender/race as a model **input** — or output them at all |
 
-This distinction is the ethical core of the project: it is **age estimation for
-aggregate analytics**, *not* face recognition. It is designed to fall **outside**
-the "biometric identification" category of the EU AI Act (see
-[Regulatory Analysis](#regulatory-analysis)).
+This is **age estimation for analytics**, *not* face recognition. The model sees
+only raw pixels and outputs only an age group; race and gender are used purely as
+ground-truth labels to *check* that accuracy is fair across groups.
 
 ---
 
 ## Table of Contents
 1. [Goal & Framing](#what-this-system-does-and-deliberately-does-not-do)
-2. [System Architecture](#system-architecture)
-3. [The Data Strategy](#the-data-strategy)
+2. [Datasets](#datasets)
+3. [System / Pipeline Architecture](#system--pipeline-architecture)
 4. [Model Design](#model-design)
-5. [Responsible-AI Layer](#responsible-ai-layer)
-6. [Regulatory Analysis](#regulatory-analysis)
-7. [Tech Stack](#tech-stack)
-8. [Project Structure](#project-structure)
-9. [Setup & Running](#setup--running)
-10. [Project Status](#project-status)
-11. [Risks & Limitations](#risks--limitations)
+5. [Results](#results)
+6. [Fairness Analysis](#fairness-analysis)
+7. [Responsible-AI Coverage](#responsible-ai-coverage)
+8. [Regulatory Analysis](#regulatory-analysis)
+9. [Tech Stack](#tech-stack)
+10. [Project Structure](#project-structure)
+11. [Setup & Running](#setup--running)
+12. [Project Status](#project-status)
+13. [Risks & Limitations](#risks--limitations)
 
 ---
 
-## System Architecture
+## Datasets
 
-The system is organised as **five layers**. Data flows upward; the
-Responsible-AI layer wraps every stage.
+**Two datasets are used, for two different jobs. They are NOT merged.**
+
+| Dataset | Role | Age labels | Race | License | Why |
+|---------|------|:----------:|:----:|---------|-----|
+| **UTKFace** | **Training** + per-group accuracy testing | ✅ per-image | ✅ 5 | Non-commercial research | Only dataset with real per-image age **and** race + gender labels — the only one that can train an age model |
+| **FairFace** (Kaggle race mirror) | **Fairness testing only** | ❌ none | ✅ 7 | CC BY 4.0 | Balanced across 7 races → ideal for auditing bias; used to check prediction *consistency* across races |
+
+**Not used:**
+- **Adience — dropped.** Too small (~3k usable), coarse age *ranges* only, and **no race labels** — so it can't contribute to the race-fairness analysis that is the point of the project.
+- **CASIA-WebFace, MegaFace — rejected.** Face-*identity* datasets with **no age labels** (wrong task), plus consent/ethics problems (MegaFace was decommissioned in 2020; CASIA was scraped without consent).
+
+> ⚠️ **`crop_part1` is NOT a separate dataset.** UTKFace's Kaggle package ships
+> `utkface/`, `crop_part1/`, and `utkface_aligned_cropped/`. Verified: `crop_part1`
+> is **9,779/9,780 duplicate images already in `utkface/`**. We use **`utkface/`
+> only** — adding `crop_part1` would inject duplicates and cause train/test leakage.
+
+---
+
+## System / Pipeline Architecture
 
 ```mermaid
 flowchart TB
-    subgraph DATA["1 · DATA LAYER  (data.py)"]
-        FF[FairFace<br/>race-balanced<br/>→ TRAIN]
-        UTK[UTKFace<br/>→ HELD-OUT TEST]
-        ADI[Adience<br/>→ HELD-OUT TEST]
-        FF & UTK & ADI --> CANON[Canonical schema<br/>age_bin · gender · race_fine/coarse<br/>+ provenance + license]
-        CANON --> DEDUP[Clean + de-duplicate<br/>perceptual hash · corrupt-image filter]
+    subgraph DATA["DATA"]
+        UTK["UTKFace<br/>~23.7k images<br/>age + race + gender"]
+        FF["FairFace<br/>race-balanced<br/>(no age labels)"]
     end
 
-    subgraph PREP["2 · PREPROCESSING"]
-        DEDUP --> IMG[Decode → resize 224²<br/>→ ImageNet normalize<br/>→ augment - train only]
+    subgraph PREP["PREPROCESSING"]
+        UTK --> CLEAN["Clean · bin age into 9 groups<br/>drop unknown/º label errors<br/>GDPR data-minimization"]
+        CLEAN --> IMG["Decode → resize 96×96 → ÷255"]
     end
 
-    subgraph MODEL["3 · MODEL  (model.py)"]
-        IMG --> BACK[Pretrained backbone<br/>ViT-B / ResNet-50<br/>transfer learning]
-        BACK --> AGE[AGE head<br/>9-way · PRIMARY OUTPUT]
-        BACK -.aux, training only.-> GEN[gender head]
-        BACK -.aux, training only.-> RACE[race head]
+    subgraph MODEL["MODEL (single-task)"]
+        IMG --> MN["MobileNetV2 backbone<br/>ImageNet · transfer learning<br/>2-stage: frozen → fine-tune"]
+        MN --> HEAD["Head: GAP → Dropout → Dense128 → Dense9 softmax"]
+        HEAD --> AGE["AGE GROUP<br/>the ONLY output"]
     end
 
-    subgraph EVAL["4 · EVALUATION  (metrics.py)"]
-        AGE --> ACC[Overall accuracy / MAE]
-        AGE --> FAIR[Per-subgroup fairness<br/>accuracy gaps · equalized odds]
-        AGE --> XDS[Cross-dataset generalization<br/>FairFace → UTKFace / Adience]
+    subgraph EVAL["FAIRNESS & RISK"]
+        AGE --> RACC["Per-race / per-gender accuracy<br/>(UTKFace test) → accuracy-parity gap"]
+        FF --> DIST["Prediction-distribution consistency<br/>across FairFace races"]
+        AGE --> DIST
     end
 
-    subgraph EXPLAIN["5 · EXPLAINABILITY  (explain.py)"]
-        AGE --> CAM[Grad-CAM / attention<br/>are errors keyed on race features?]
-    end
-
-    GOV[[RESPONSIBLE-AI LAYER<br/>risk register · model card · tests ≥80% · EU AI Act / GDPR]]
+    GOV["RESPONSIBLE-AI: risk matrix (R1-R8) · GDPR + EU AI Act · model card (Wk3)"]
     GOV -.governs.- DATA
     GOV -.governs.- MODEL
     GOV -.governs.- EVAL
-    GOV -.governs.- EXPLAIN
 
     classDef primary fill:#5b1a3a,color:#fff,stroke:#5b1a3a;
-    classDef aux fill:#eee,color:#555,stroke:#bbb,stroke-dasharray:4 3;
     class AGE primary;
-    class GEN,RACE aux;
 ```
 
-**Key architectural decisions**
+**Key design decisions**
 
-1. **Train on FairFace, test on unseen UTKFace + Adience.** FairFace is
-   race-balanced by construction, so it stays a clean, balanced training anchor.
-   Proving the model still works on datasets it *never saw* is a stronger
-   responsibility story than training on more (imbalanced) rows.
-2. **Multi-task, single-output.** The backbone learns shared face features; a
-   primary **age head** plus **auxiliary gender/race heads**. The auxiliary heads
-   exist *only* to measure and mitigate bias during training/evaluation — they are
-   **never exposed at deployment**. This is what makes the system "race-agnostic"
-   in a measurable, not just aspirational, way.
-3. **Transfer learning, not from scratch.** A pretrained backbone converges fast
-   and needs far less data — appropriate for the timeframe and dataset size.
-
----
-
-## The Data Strategy
-
-Three datasets, three distinct jobs. **Not merged** — kept as a train/test split
-across sources so fairness metrics stay interpretable (merging would confound
-"which dataset" with "which subgroup").
-
-| Dataset | Role | Age | Gender | Race | License |
-|---------|------|:---:|:------:|:----:|---------|
-| **FairFace** | **Train anchor** (balanced) | ✅ 9 bins | ✅ | ✅ 7 | CC BY 4.0 |
-| **UTKFace** | Held-out test | ✅ | ✅ | ✅ 5 | Non-commercial research |
-| **Adience** | Held-out test | ✅ | ✅ | ❌ | Research |
-
-**Rejected:** CASIA-WebFace and MegaFace — no age labels (wrong task) *and*
-consent/ethics concerns (MegaFace decommissioned 2020; CASIA scraped without
-consent). Excluding them is itself a responsible-AI point.
-
-All three are harmonised by `data.py` into one **canonical schema** with two race
-columns: `race_fine` (7-way, FairFace-only reliable) and `race_coarse`
-(White/Black/Asian/Indian/Other/Unknown — the common scheme used for
-cross-dataset fairness). Every row carries `dataset_source`, original labels, and
-`license` for full provenance.
+1. **Train on UTKFace, fairness-test on FairFace.** UTKFace is the only source
+   with real per-image age labels (needed to train). FairFace is race-balanced,
+   making it ideal to *audit* the trained model for race bias.
+2. **Single-task by design — the model never computes race or gender.** Race and
+   gender are *never* model inputs or outputs; they exist only as dataset labels
+   used to slice accuracy for fairness auditing. This is a stronger "race-agnostic"
+   guarantee than merely not exposing an internal prediction — the model literally
+   cannot output a protected attribute.
+3. **Transfer learning (MobileNetV2), not from scratch.** A CPU-friendly
+   ImageNet-pretrained backbone converges fast on limited compute.
 
 ---
 
 ## Model Design
 
 ```
-Input face 224×224×3
+Input face 96×96×3   (race & gender NEVER used as input)
       │
       ▼
-Pretrained backbone (ViT-B/16 or ResNet-50)   ← ImageNet weights, fine-tuned
-      │  shared 768-d (ViT) / 2048-d (ResNet) feature vector
-      ├───────────────► Age head    → softmax over 9 age bins   [DEPLOYED]
-      ├───────────────► Gender head → 2-way    (training only)  [audit]
-      └───────────────► Race head   → 5-way    (training only)  [audit]
-
-Loss = age_loss + λ_g · gender_loss + λ_r · race_loss   (auxiliary weighted low)
+MobileNetV2 backbone  (ImageNet weights, include_top=False)
+      │   Stage 1: fully frozen   ·   Stage 2: last 30 layers fine-tuned @ 10× lower LR
+      ▼
+GlobalAveragePooling2D → Dropout(0.5) → Dense(128, ReLU) → Dense(9, softmax)
+      │
+      ▼
+Age group ∈ {0-2, 3-9, 10-19, 20-29, 30-39, 40-49, 50-59, 60-69, 70+}
 ```
 
-- **Backbone:** start with one, keep the other as a comparison baseline.
-- **Imbalance:** class weights / targeted augmentation on starved age×race cells,
-  decided *after* EDA.
-- **Baseline first:** a plain single-task age classifier is built first as the
-  Week-2 baseline; the auxiliary heads are added on top.
+- **Loss:** categorical cross-entropy · **Optimizer:** Adam · **EarlyStopping** on val accuracy
+- **Class weights** applied to compensate for age-group imbalance (few 0-2 / 60-69 / 70+)
+- **Two-stage training:** (1) train the head with the backbone frozen; (2) unfreeze
+  the last 30 backbone layers at a 10× lower learning rate to specialize on faces
+- **Why classification, not regression:** retail analytics needs age *bands*, and
+  classification gives a probability per band (adjacent-class confusion is the
+  accepted cost — addressed by a planned Week-3 "one-off accuracy" metric)
 
 ---
 
-## Responsible-AI Layer
+## Results
 
-| Concern | How it is addressed |
-|---------|---------------------|
-| **Fairness** | Per-subgroup accuracy & equalized-odds-style gaps on `race_coarse` and gender; the whole train/test design targets this. |
-| **Explainability (XAI)** | Grad-CAM / attention maps on correct *and* misclassified subgroup samples — checking the model keys on age cues, not race-correlated features. |
-| **Robustness / Testing** | `pytest` suite incl. invariance tests (skin-tone/lighting shifts shouldn't swing age); target ≥ 80 % coverage. |
-| **Transparency** | Pseudo-**Model Card** at the end of the notebook: intended use, limitations, biases, attacks, restrictions. |
-| **Privacy** | Data minimisation by design — no identity, no stored faces/embeddings, only aggregate age buckets. |
+*(From the run of 6 July 2026 — re-run the evaluation cells to refresh.)*
+
+| Metric | Value |
+|--------|-------|
+| Stage-1 test accuracy (frozen backbone) | 43.06% |
+| **Final test accuracy (after fine-tuning)** | **46.16%** |
+| Train / Val / Test split | 16,578 / 3,553 / 3,553 |
+| Chance baseline (9 classes) | 11.1% → model is ~4× better than random |
+
+~46% reflects strict scoring (predicting "30-39" for a 41-year-old counts as fully
+wrong) and CPU-limited input size (96×96). What matters more here is **fairness
+consistency**, below.
+
+---
+
+## Fairness Analysis
+
+**Named metric: accuracy parity** — the gap between the best- and worst-performing group.
+
+**Per-race accuracy (UTKFace test set):**
+
+| Race | Accuracy |
+|------|----------|
+| Asian | 55.62% |
+| Other | 48.12% |
+| Indian | 48.00% |
+| White | 43.68% |
+| Black | 42.52% |
+| **Overall** | **46.16%** |
+
+**Accuracy parity gap: 13.10 pp** (Asian best, Black worst). Notably the majority
+White class lands *below* average — a counterintuitive result that measurement
+revealed and assumption would have missed (candidate causes analyzed in the notebook).
+
+Two complementary methods are used: **per-race / per-gender accuracy** on UTKFace
+(has ground-truth ages), and **prediction-distribution consistency** across
+FairFace's balanced races (no ages → consistency, not correctness).
+
+---
+
+## Responsible-AI Coverage
+
+| Concern | How it is addressed | Status |
+|---------|---------------------|:------:|
+| **Fairness** | Per-race & per-gender accuracy parity + FairFace consistency | ✅ Week 2 |
+| **Risk** | R1-R8 risk matrix (likelihood/impact/treatment) + worked examples | ✅ Week 2 |
+| **Privacy** | GDPR data-minimization: no identity, no face storage, age-only output; minors flagged | ✅ Week 1 |
+| **Regulatory** | GDPR + EU AI Act analysis (see below) | ✅ Week 1 |
+| **Explainability (XAI)** | Grad-CAM on last conv layer — tests Risk R3 (proxy features) | ⬜ Week 3 |
+| **Testing** | `pytest` suite (age binning, parsing, split integrity, fairness-regression check), ≥80% coverage | ⬜ Week 3 |
+| **Model card** | Mitchell-et-al. style pseudo-model-card | ⬜ Week 3-4 |
 
 ---
 
 ## Regulatory Analysis
 
-- **EU AI Act:** deliberately designed to avoid the *prohibited*/high-risk
-  "biometric identification & categorisation" bucket — the system estimates a
-  coarse age group for **aggregate** analytics and does **not** identify
-  individuals or output demographic categories. Age-inference for footfall
-  analytics is treated as **limited/minimal-risk**, with transparency obligations
-  met via this documentation and model card.
-- **GDPR:** faces are special-category biometric data *only* when used to uniquely
-  identify a person — which this system explicitly does not do. Principles applied:
-  **data minimisation** (no raw-image retention, aggregate outputs only),
-  **purpose limitation** (analytics only), and honest handling of the **training
-  data's own licence** (UTKFace is non-commercial — a real deployment blocker,
-  documented rather than hidden).
+Full write-up lives in the notebook's **Week 1 → Regulatory Analysis** section
+(also in [`Code/regulatory_analysis.md`](Code/regulatory_analysis.md)). Summary:
 
-*(Full write-up: [`regulatory_analysis.md`](regulatory_analysis.md) — paste directly into the notebook's Regulatory section as markdown cells.)*
+- **EU AI Act:** **Not prohibited** (Art. 5 bans inferring *sensitive* attributes;
+  age is not one, and we never infer race/gender). **High-risk status is genuinely
+  ambiguous** (Annex III 1(b) covers categorization by *sensitive* attributes — age
+  arguably isn't), so a real deployer should get a formal assessment.
+  **Transparency (Art. 50)** applies regardless — in-store signage is mandatory.
+- **GDPR:** Faces are special-category biometric data only when used for *unique
+  identification*, which this system does not do — but we adopt the conservative
+  Art. 9 treatment anyway. Principles applied: **data minimization**, **purpose
+  limitation**, and honest handling of UTKFace's **non-commercial licence** (a real
+  deployment blocker). A **DPIA** would be mandatory before any real deployment.
 
 ---
 
@@ -186,63 +215,64 @@ Loss = age_loss + λ_g · gender_loss + λ_r · race_loss   (auxiliary weighted 
 | Layer | Tool |
 |-------|------|
 | Language | Python 3.11 |
-| Data / tables | pandas, numpy |
-| Images | Pillow (+ perceptual hashing, dependency-free) |
-| Model | PyTorch + Hugging Face `transformers` / `timm` |
-| Fairness | fairlearn (per-subgroup metrics) |
-| Explainability | Captum / Grad-CAM |
-| Testing | pytest + pytest-cov |
+| Model | **TensorFlow / Keras** — MobileNetV2 (transfer learning) |
+| ML utilities | scikit-learn (split, class weights, metrics) |
+| Data / images | pandas, numpy, Pillow |
+| Visualization | matplotlib, seaborn |
 | Presentation | Jupyter Notebook |
+| *Planned (Week 3)* | pytest + pytest-cov · Grad-CAM |
+
+> Note: `Code/face_age/data.py` is an **optional local helper** (canonical-schema
+> loaders + dedup) used for local analysis on Windows. The graded notebook is
+> **self-contained** and does not depend on it.
 
 ---
 
 ## Project Structure
 
 ```
-Code/
-├── README.md                 # this file
-├── face_age/                 # importable, testable package
-│   ├── __init__.py
-│   ├── data.py               # ✅ loading, canonical schema, cleaning, dedup
-│   ├── model.py              # ⬜ backbone + age/aux heads
-│   ├── metrics.py            # ⬜ subgroup fairness metrics
-│   └── explain.py            # ⬜ Grad-CAM / attention XAI
-├── tests/                    # ⬜ pytest suite (≥80% coverage)
-├── data/                     # (git-ignored) raw datasets
-│   ├── fairface/  utkface/  adience/
-└── FaceRecognition_Project.ipynb   # ⬜ the graded deliverable/presentation
+Face Recognition Project/
+├── README.md                                   # this file
+├── exam topic and guidelines.pdf
+└── Code/
+    ├── Responsible_Age_Classifier_Week1_2.ipynb   # ★ THE deliverable (Keras, trained, Wk1+Wk2)
+    ├── UTKface(train)fface(test).ipynb            # earlier draft (superseded)
+    ├── regulatory_analysis.md / Regulatory_Analysis.docx   # standalone regulatory reference
+    └── face_age/
+        ├── __init__.py
+        └── data.py                                # optional local data-loader utility
+
+Datasets live OUTSIDE the repo (git-ignored):
+  D:\nihal\utkface\      ← training
+  D:\nihal\fairface\     ← fairness testing
 ```
 
 ---
 
 ## Setup & Running
 
-```bash
-# from the Code/ folder
-pip install pandas numpy pillow torch transformers timm fairlearn captum \
-            pytest pytest-cov
+**The canonical notebook runs in a cloud JupyterHub** (paths under
+`/home/jovyan/work/data/`) and downloads its own data via the Kaggle API.
 
-# place datasets under Code/data/{fairface,utkface,adience}/  then:
-python face_age/data.py        # smoke test: loads + summarises what's present
+```bash
+pip install tensorflow scikit-learn pandas numpy pillow matplotlib seaborn kaggle
+# open Responsible_Age_Classifier_Week1_2.ipynb and run top-to-bottom
+# (a "Recovery Cell" reloads the saved model + splits after a restart)
 ```
 
-> On this machine, use the working venv Python
-> (`ML practice/ml_env/Scripts/python.exe`) — the system Python is broken.
+**To run locally instead:** change the `BASE` path in the notebook's Path-Setup
+cell to point at your local `utkface/` and `fairface/` folders (e.g. `D:\nihal`).
 
 ---
 
 ## Project Status
 
-| Component | Status |
-|-----------|:------:|
-| Data loading + canonical schema (`data.py`) | ✅ done |
-| Cleaning + perceptual-hash de-duplication | ✅ done, tested |
-| EDA (in notebook) | 🟡 pending data download |
-| Baseline model | ⬜ Week 2 |
-| Fairness metrics | ⬜ Week 2 |
-| XAI (Grad-CAM) | ⬜ Week 3 |
-| Test suite ≥ 80 % | ⬜ Week 3 |
-| Model card + management pitch | ⬜ Week 4 |
+| Week | Goals | Status |
+|------|-------|:------:|
+| **Week 1** | Data analysis · plan · architecture · regulatory analysis | ✅ done |
+| **Week 2** | Baseline model · risk analysis · fairness analysis | ✅ done |
+| **Week 3** | Model analysis · XAI (Grad-CAM) · tests ≥80% coverage | ⬜ planned |
+| **Week 4** | Documentation · model card · management pitch · presentation | ⬜ planned |
 
 Delivery **2026-07-20** · Presentation **2026-07-24**.
 
@@ -250,12 +280,10 @@ Delivery **2026-07-20** · Presentation **2026-07-24**.
 
 ## Risks & Limitations
 
-- **Label noise across datasets** — age binning and race taxonomies differ; lossy
-  mappings are documented, not hidden.
-- **Age is subjective/coarse** — 9 bins, not exact age; apparent ≠ actual age.
-- **Adience has no race label** — excluded from race-fairness metrics by design.
-- **Training-data licence** — UTKFace is non-commercial; real deployment would need
-  differently-licensed data.
-- **Residual bias possible** — even balanced data can leave subgroup gaps; the
-  point is to *measure and report* them, not claim they are zero.
+- **13.1 pp race accuracy gap** (Asian vs Black) that class weights did not close — the dominant open fairness risk (R1).
+- **Elderly / infant faces underrepresented** in UTKFace — weaker on 0-2 and 70+ despite class weights (R5).
+- **Distribution shift** — UTKFace is cropped, frontal, well-lit; real camera conditions (angle, lighting, occlusion, masks) are untested (R6).
+- **FairFace has no age labels** — fairness on it is *consistency*, not *accuracy*; exact per-race accuracy comes from UTKFace only (R8).
+- **Non-consensual training data & non-commercial licence** — no commercial deployment would be defensible without re-sourcing lawfully licensed data.
+- **Age is coarse & apparent** — 9 bands, not exact age; adjacent-band errors count as wrong.
 ```

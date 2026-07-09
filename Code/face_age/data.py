@@ -271,6 +271,75 @@ def load_fairface(root: Path | None = None) -> pd.DataFrame:
     return _clean(df, "fairface")
 
 
+def load_fairface_race_only(root: Path | None = None) -> pd.DataFrame:
+    """Load the race-only FairFace dump as a FAIRNESS-TEST set (NOT training).
+
+    This is the deliberate counterpart to load_fairface(): the Kaggle
+    "fairface-race" package has race-named folders but no age/gender labels, so
+    it cannot train an age model. It CAN, however, serve as a cross-source
+    fairness probe: because it is race-balanced, we can run the trained model
+    over it and check whether the *predicted* age DISTRIBUTION differs by race.
+    That is a bias signal, not an accuracy measurement (we have no true ages
+    here), and it must be reported as such.
+
+    Returns canonical columns with age_bin/gender left as None on purpose.
+    Only the plain train/ and val/ race folders are read — train_aligned/ and
+    val_aligned/ are SKIPPED because that mirror mixes in re-hosted UTKFace
+    images, which would leak training data into the fairness test. Even so,
+    run find_duplicates([utkface_df, this_df], cross_source_only=True) before
+    trusting the numbers, since some overlap with UTKFace is possible.
+    """
+    root = Path(root) if root else DATA_ROOT / "fairface"
+    if not root.exists():
+        logger.warning("FairFace not found at %s — skipping.", root)
+        return _empty_frame()
+
+    valid_races = set(RACE_FINE) | {"Asian"}  # some mirrors merge East/SE Asian
+    rows = []
+    for split in ("train", "val"):
+        split_dir = root / split
+        if not split_dir.exists():
+            continue
+        for race_dir in split_dir.iterdir():
+            if not race_dir.is_dir() or race_dir.name not in valid_races:
+                continue
+            race_fine = race_dir.name
+            # "Asian" (merged) has no clean fine label -> mark Unknown fine,
+            # but it still maps to coarse "Asian".
+            if race_fine == "Asian":
+                race_fine_val, race_coarse_val = "Unknown", "Asian"
+            else:
+                race_fine_val = race_fine
+                race_coarse_val = _FAIRFACE_FINE_TO_COARSE.get(race_fine)
+            if race_coarse_val is None:
+                continue
+            for img in race_dir.glob("*.jpg"):
+                rows.append({
+                    "filepath": str(img.resolve()),
+                    "age_bin": None,        # NO age ground truth on purpose
+                    "gender": None,         # NO gender label
+                    "race_fine": race_fine_val,
+                    "race_coarse": race_coarse_val,
+                    "dataset_source": "fairface",
+                    "split_hint": f"{split} (fairness-only)",
+                    "original_age": "",
+                    "original_gender": "",
+                    "original_race": race_dir.name,
+                    "license": LICENSES["fairface"],
+                })
+    if not rows:
+        logger.warning("FairFace race-only: no images under %s/{train,val}/"
+                        "<race>/ — is this the race-folder dump?", root)
+        return _empty_frame()
+    df = pd.DataFrame(rows)
+    # Deliberately NOT run through _clean (which drops null age_bin) — here
+    # null age_bin is expected. Drop only rows with no resolved race.
+    df = df.dropna(subset=["race_coarse"]).reset_index(drop=True)
+    logger.info("FairFace race-only (fairness set): %d images across %d races.",
+                len(df), df["race_coarse"].nunique())
+    return df
+
+
 def load_utkface(roots: list[Path] | Path | None = None) -> pd.DataFrame:
     """Load UTKFace — now the TRAIN anchor (see PIVOT note at top of module).
 
@@ -279,22 +348,25 @@ def load_utkface(roots: list[Path] | Path | None = None) -> pd.DataFrame:
         race:   0=White 1=Black 2=Asian 3=Indian 4=Others
     Malformed / truncated filenames are skipped and counted.
 
-    UTKFace's Kaggle package ships the same images under THREE overlapping
-    folders: "utkface" (23,708 imgs), "crop_part1" (9,780 extra imgs, mostly
-    older ages), and "utkface_aligned_cropped" (a wrapper that DUPLICATES both
-    of the above inside it, confirmed by matching file counts). We therefore
-    scan "utkface" + "crop_part1" by default and deliberately do NOT touch
-    "utkface_aligned_cropped" — scanning it too would silently double-count
-    every image.
+    CRITICAL — do NOT scan multiple UTKFace folders naively. The Kaggle package
+    ships the SAME images three ways: "utkface/" (the complete 23,708-image set),
+    "crop_part1/" (9,780 images — verified to be 9,779/9,780 DUPLICATE filenames
+    already in "utkface/", NOT extra data), and "utkface_aligned_cropped/" (a
+    wrapper duplicating both). "utkface/" alone is the full unique set. Scanning
+    crop_part1 or the wrapper too would inject ~9,779 duplicate images and cause
+    train/test leakage. We therefore default to "utkface/" ONLY, and dedup by
+    filename as a belt-and-suspenders guard if extra roots are ever passed.
     """
     if roots is None:
-        roots = [DATA_ROOT / "utkface", DATA_ROOT / "crop_part1"]
+        roots = [DATA_ROOT / "utkface"]           # the complete unique set
     elif isinstance(roots, (str, Path)):
         roots = [Path(roots)]
     else:
         roots = [Path(r) for r in roots]
 
     jpgs: list[Path] = []
+    seen_names: set[str] = set()                   # dedup by filename
+    n_dupes = 0
     for root in roots:
         if not root.exists():
             logger.warning("UTKFace: folder not found at %s — skipping it.",
@@ -302,7 +374,15 @@ def load_utkface(roots: list[Path] | Path | None = None) -> pd.DataFrame:
             continue
         found = list(root.rglob("*.jpg"))
         logger.info("UTKFace: found %d .jpg files under %s", len(found), root)
-        jpgs.extend(found)
+        for p in found:
+            if p.name in seen_names:
+                n_dupes += 1
+                continue
+            seen_names.add(p.name)
+            jpgs.append(p)
+    if n_dupes:
+        logger.info("UTKFace: skipped %d duplicate filenames across roots "
+                    "(e.g. crop_part1 overlaps utkface).", n_dupes)
 
     if not jpgs:
         logger.warning("UTKFace: no .jpg files found under any of %s", roots)
