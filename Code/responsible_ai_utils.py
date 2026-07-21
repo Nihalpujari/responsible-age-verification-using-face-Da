@@ -76,3 +76,29 @@ def accuracy_parity_gap(acc_dict):
 def fairness_check(acc_dict, max_gap):
     """Weakness detection: True iff the accuracy parity gap is within threshold."""
     return accuracy_parity_gap(acc_dict) <= max_gap
+
+
+# ---------- deployment decision logic (age-restricted sales) ----------
+
+def p_at_least(probs, band_frac):
+    """P(age >= threshold) from 9-band probabilities.
+
+    All probability mass in bands 20-29 and above counts fully. The 10-19 band
+    straddles the legal threshold of 18, so only `band_frac` of it counts —
+    that fraction is derived from the data, not assumed uniform.
+    """
+    probs = list(probs)
+    return float(sum(probs[3:]) + probs[2] * band_frac)
+
+
+def decide(p_over, p_approve=0.95, p_reject=0.05):
+    """Three-way deployment policy for an age-restricted sale.
+
+    Returns 'auto-clear', 'auto-reject', or 'human-review'. The abstention band
+    between the thresholds is what keeps a human in the loop (EU AI Act Art. 14).
+    """
+    if p_over >= p_approve:
+        return "auto-clear"
+    if p_over <= p_reject:
+        return "auto-reject"
+    return "human-review"

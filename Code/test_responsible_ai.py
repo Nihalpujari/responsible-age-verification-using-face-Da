@@ -1,3 +1,4 @@
+%%writefile test_responsible_ai.py
 """Automated test suite — run with:
     pytest test_responsible_ai.py -v --cov=responsible_ai_utils --cov-report=term
 """
@@ -8,6 +9,7 @@ import pytest
 from responsible_ai_utils import (age_to_group, parse_utk_filename, clean_utk,
                                   splits_disjoint, one_off_correct,
                                   accuracy_parity_gap, fairness_check,
+                                  p_at_least, decide,
                                   AGE_GROUP_LABELS)
 
 
@@ -110,3 +112,52 @@ def test_fairness_check_passes_within_threshold():
 
 def test_fairness_check_fails_beyond_threshold():
     assert not fairness_check({"A": 0.56, "B": 0.42}, max_gap=0.10)
+
+
+# ---------- deployment decision logic (age-restricted sales) ----------
+def _probs(**kw):
+    """Build a 9-band probability vector, e.g. _probs(**{'0': .8, '2': .2})."""
+    p = [0.0] * 9
+    for i, v in kw.items():
+        p[int(i)] = v
+    return p
+
+def test_all_adult_mass_gives_certainty():
+    assert p_at_least(_probs(**{"4": 1.0}), band_frac=0.2) == pytest.approx(1.0)
+
+def test_all_child_mass_gives_zero():
+    assert p_at_least(_probs(**{"0": 1.0}), band_frac=0.2) == pytest.approx(0.0)
+
+def test_teen_band_counts_only_partially():
+    # all mass in 10-19, 20% of that band is 18+  ->  P = 0.20
+    assert p_at_least(_probs(**{"2": 1.0}), band_frac=0.2) == pytest.approx(0.2)
+
+def test_probability_stays_in_range():
+    for p in [_probs(**{"0": 1.0}), _probs(**{"2": 1.0}), _probs(**{"8": 1.0})]:
+        assert 0.0 <= p_at_least(p, 0.2) <= 1.0
+
+def test_lower_threshold_is_never_stricter():
+    # more of the 10-19 band is 16+ than 18+, so P(>=16) >= P(>=18)
+    p = _probs(**{"2": 1.0})
+    assert p_at_least(p, band_frac=0.40) >= p_at_least(p, band_frac=0.20)
+
+def test_decision_thresholds():
+    assert decide(0.99) == "auto-clear"
+    assert decide(0.01) == "auto-reject"
+    assert decide(0.50) == "human-review"
+    assert decide(0.95) == "auto-clear"           # boundary is inclusive
+    assert decide(0.05) == "auto-reject"
+
+
+# ---------- SAFETY: minors must never be auto-approved ----------
+def test_young_child_is_never_auto_cleared():
+    for band in ["0", "1"]:                       # 0-2 and 3-9
+        assert decide(p_at_least(_probs(**{band: 1.0}), 0.2)) != "auto-clear"
+
+def test_teen_band_alone_never_auto_clears():
+    # 10-19 straddles the legal age of 18: on its own it must always escalate
+    assert decide(p_at_least(_probs(**{"2": 1.0}), 0.2)) != "auto-clear"
+
+def test_mixed_child_teen_never_auto_clears():
+    p = _probs(**{"1": 0.5, "2": 0.5})            # half 3-9, half 10-19
+    assert decide(p_at_least(p, 0.2)) != "auto-clear"
